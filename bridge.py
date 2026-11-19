@@ -18,7 +18,8 @@ from aiosendspin.server.audio import AudioFormat
 LOG = logging.getLogger("omarchy.sendspin")
 PREFIX = "omarchy_sendspin_"
 FORMAT = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
-CHUNK_BYTES = 960 * 4  # 20 ms of stereo PCM.
+CAPTURE_MS = 10
+CHUNK_BYTES = 48000 * CAPTURE_MS // 1000 * 4
 
 
 async def pactl(*args):
@@ -171,13 +172,15 @@ class Bridge:
                         break
                     await asyncio.sleep(0.1)
             stream = client.group.start_stream()
+            # Live capture cannot fill the larger queue used for buffered media.
+            stream.set_live_source(True)
             capture = await asyncio.create_subprocess_exec(
                 "parec",
                 f"--device={output.name}.monitor",
                 "--format=s16le",
                 "--rate=48000",
                 "--channels=2",
-                "--latency-msec=20",
+                f"--latency-msec={CAPTURE_MS}",
                 "--client-name=Omarchy Sendspin",
                 "--raw",
                 stdout=asyncio.subprocess.PIPE,

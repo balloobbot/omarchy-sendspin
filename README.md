@@ -11,6 +11,8 @@ No pairing code is required. Playback starts only when an app sends audio to a S
 Requires Omarchy with PipeWire's PulseAudio interface, `pactl`, `parec`, `uv`, and a systemd user session.
 
 ```sh
+git clone https://github.com/balloobbot/omarchy-sendspin.git
+cd omarchy-sendspin
 ./install.sh
 ```
 
@@ -29,7 +31,9 @@ Disabling the plugin stops the bridge and removes its outputs. If a selected pla
 
 - Up to 32 unpaired players are exposed as separate outputs.
 - Audio is captured as 48 kHz stereo PCM. The Sendspin library converts it to a format the player supports.
-- Network playback adds buffering delay. This version has no video delay compensation or synchronized group picker.
+- Live-audio mode avoids the extra lead time used for buffered media. Capture uses 10 ms chunks and requests a 10 ms PulseAudio buffer. Each player’s advertised minimum buffer, codec delay, and output delay still apply. The library also enforces a 50 ms scheduling floor; this is not an end-to-end latency guarantee.
+- This version has no video delay compensation or synchronized group picker.
+- Device renaming is not supported by the Sendspin specification.
 - The normal volume slider adjusts the audio sent from this computer. It does not change the player's hardware volume.
 - No microphone capture, pairing management, or persistent client approvals.
 
@@ -61,6 +65,6 @@ SENDSPIN_AUDIO_TEST=1 uv run pytest
 omarchy plugin validate "$PWD/plugin"
 ```
 
-The optional audio tests need a running local PipeWire server. They create a temporary virtual output and a local Sendspin receiver. The receiver checks the audio bytes without playing them aloud. Tests cover both connection directions, output names, mute, and cleanup.
+The optional audio tests need a running local PipeWire server. They create a temporary virtual output and a local Sendspin receiver. The receiver checks the audio bytes without playing them aloud. Tests cover both connection directions, live-audio scheduling, output names, mute, and cleanup.
 
 Protocol implementation: [aiosendspin](https://github.com/Sendspin/aiosendspin).

@@ -75,6 +75,8 @@ async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initi
         client_name="Omarchy test speaker",
         roles=[Roles.PLAYER],
         pairing_store=store,
+        min_buffer_ms=50,
+        required_lead_time_ms=1000,
         player_support=ClientHelloPlayerSupport(
             supported_formats=[
                 SupportedAudioFormat(
@@ -86,9 +88,13 @@ async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initi
     )
     bridge = Bridge(server)
     received = []
-    client.add_audio_chunk_listener(
-        lambda timestamp, pcm, fmt, ahead: received.append(pcm)
-    )
+    send_ahead = []
+
+    def receive(timestamp, pcm, fmt, ahead):
+        received.append(pcm)
+        send_ahead.append(ahead)
+
+    client.add_audio_chunk_listener(receive)
     playback = None
     listener = None
     name = sink_name(client.identity.peer_id)
@@ -155,6 +161,8 @@ async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initi
                 await bridge.reconcile()
                 await asyncio.sleep(0.02)
         assert await server.pairing_store.trusted_unpaired(client.identity.peer_id)
+        # A live source honors the 50 ms minimum, not the 1000 ms buffered lead.
+        assert 0 < send_ahead[0] < 250_000
         # Muting the selected output must silence the network stream too.
         await pactl("set-sink-mute", name, "1")
         for _ in range(80):
