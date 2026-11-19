@@ -22,9 +22,9 @@ CAPTURE_MS = 10
 CHUNK_BYTES = 48000 * CAPTURE_MS // 1000 * 4
 
 
-async def pactl(*args):
+async def run(*args):
     process = await asyncio.create_subprocess_exec(
-        "pactl", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     try:
         async with asyncio.timeout(5):
@@ -37,6 +37,10 @@ async def pactl(*args):
     if process.returncode:
         raise RuntimeError(err.decode(errors="replace").strip())
     return out.decode().strip()
+
+
+async def pactl(*args):
+    return await run("pactl", *args)
 
 
 async def pulse_list(kind):
@@ -155,9 +159,70 @@ class Bridge:
                     await output.task
                 output.task = None
 
+    async def control_volume(self, output, role, ready):
+        subscriber = await asyncio.create_subprocess_exec(
+            "pactl",
+            "subscribe",
+            stdout=asyncio.subprocess.PIPE,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        try:
+            sink = next(
+                s for s in await pulse_list("sinks") if s["name"] == output.name
+            )
+            # Keep the player's current loudness when switching from local gain.
+            await pactl("set-sink-volume", output.name, f"{role.get_player_volume()}%")
+            muted = role.get_player_muted()
+            if muted is not None:
+                await pactl("set-sink-mute", output.name, "1" if muted else "0")
+            await run(
+                "pw-cli",
+                "set-param",
+                str(sink["properties"]["object.id"]),
+                "Props",
+                '{"params": ["monitor.channel-volumes", false], "monitorVolumes": [1.0, 1.0], "monitorMute": false}',
+            )
+            previous = None
+            ready.set()
+            while True:
+                sink = next(
+                    s for s in await pulse_list("sinks") if s["name"] == output.name
+                )
+                volume = min(
+                    100,
+                    max(
+                        0,
+                        round(
+                            max(v["value"] for v in sink["volume"].values())
+                            * 100
+                            / 65536
+                        ),
+                    ),
+                )
+                current = (volume, sink["mute"])
+                if current != previous:
+                    # Players without mute support use zero volume while muted.
+                    role.set_player_volume(
+                        0 if current[1] and muted is None else volume
+                    )
+                    if muted is not None:
+                        role.set_player_mute(current[1])
+                    previous = current
+                while True:
+                    line = await subscriber.stdout.readline()
+                    if not line:
+                        raise RuntimeError("PulseAudio volume subscription ended")
+                    if line.rstrip().endswith(f"on sink #{sink['index']}".encode()):
+                        break
+        finally:
+            if subscriber.returncode is None:
+                subscriber.terminate()
+            await subscriber.wait()
+
     async def stream(self, output):
         capture = None
         stream = None
+        volume_task = None
         try:
             await self.server.trust_unpaired(output.client_id)
             self.server.reclaim_client_for_playback(output.client_id, timeout_s=10)
@@ -168,9 +233,21 @@ class Bridge:
                         client
                         and client.is_connected
                         and "player@v1" in client.active_role_ids
+                        and not client.awaits_role_state("player")
                     ):
                         break
                     await asyncio.sleep(0.1)
+            role = client.role("player@v1")
+            if role and role.get_player_volume() is not None:
+                ready = asyncio.Event()
+                volume_task = asyncio.create_task(
+                    self.control_volume(output, role, ready)
+                )
+                async with asyncio.timeout(5):
+                    while not ready.is_set():
+                        if volume_task.done():
+                            volume_task.result()
+                        await asyncio.sleep(0.01)
             stream = client.group.start_stream()
             # Live capture cannot fill the larger queue used for buffered media.
             stream.set_live_source(True)
@@ -182,12 +259,15 @@ class Bridge:
                 "--channels=2",
                 f"--latency-msec={CAPTURE_MS}",
                 "--client-name=Omarchy Sendspin",
+                "--property=node.dont-move=true",
                 "--raw",
                 stdout=asyncio.subprocess.PIPE,
                 limit=CHUNK_BYTES * 4,
             )
             LOG.info("Streaming to %s", description(client.name))
             while client.is_connected and "player@v1" in client.active_role_ids:
+                if volume_task and volume_task.done():
+                    volume_task.result()
                 async with asyncio.timeout(5):
                     pcm = await capture.stdout.readexactly(CHUNK_BYTES)
                     stream.prepare_audio(pcm, FORMAT)
@@ -201,6 +281,10 @@ class Bridge:
             LOG.exception("Playback failed for %s", output.name)
             await self.restore(output.name)
         finally:
+            if volume_task:
+                volume_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await volume_task
             if capture and capture.returncode is None:
                 capture.terminate()
                 try:
@@ -211,6 +295,24 @@ class Bridge:
                     await capture.wait()
             if stream:
                 stream.stop()
+            if volume_task:
+                with suppress(RuntimeError, TimeoutError):
+                    sink = next(
+                        (
+                            s
+                            for s in await pulse_list("sinks")
+                            if s["name"] == output.name
+                        ),
+                        None,
+                    )
+                    if sink:
+                        await run(
+                            "pw-cli",
+                            "set-param",
+                            str(sink["properties"]["object.id"]),
+                            "Props",
+                            '{"params": ["monitor.channel-volumes", true]}',
+                        )
             await self.server.untrust_unpaired(output.client_id)
 
     async def close(self):

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from aiosendspin.client import ClientListener, SendspinClient
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
-from aiosendspin.models.types import AudioCodec, Roles
+from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.noise import (
     Identity,
     InMemoryClientPairingStore,
@@ -59,7 +59,10 @@ def test_pairing_only_and_non_players_are_excluded():
     reason="Requires the local PipeWire server",
 )
 @pytest.mark.parametrize("server_initiated", [False, True])
-async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initiated):
+@pytest.mark.parametrize("remote_volume", [False, True, "volume-only"])
+async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(
+    server_initiated, remote_volume
+):
     server = SendspinServer(
         loop=asyncio.get_running_loop(),
         identity=Identity.generate(),
@@ -75,6 +78,11 @@ async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initi
         client_name="Omarchy test speaker",
         roles=[Roles.PLAYER],
         pairing_store=store,
+        initial_volume=35 if remote_volume else 100,
+        state_supported_commands=[PlayerCommand.VOLUME]
+        + ([PlayerCommand.MUTE] if remote_volume is True else [])
+        if remote_volume
+        else [],
         min_buffer_ms=50,
         required_lead_time_ms=1000,
         player_support=ClientHelloPlayerSupport(
@@ -95,6 +103,8 @@ async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initi
         send_ahead.append(ahead)
 
     client.add_audio_chunk_listener(receive)
+    commands = []
+    client.add_server_command_listener(lambda payload: commands.append(payload.player))
     playback = None
     listener = None
     name = sink_name(client.identity.peer_id)
@@ -141,6 +151,9 @@ async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initi
         playback = await asyncio.create_subprocess_exec(
             "pacat",
             "--playback",
+            "--client-name=Omarchy Sendspin test",
+            "--property=node.dont-move=true",
+            "--volume=65536",
             "--raw",
             f"--device={name}",
             "--rate=48000",
@@ -163,13 +176,45 @@ async def test_pipewire_audio_reaches_unpaired_client_and_cleans_up(server_initi
         assert await server.pairing_store.trusted_unpaired(client.identity.peer_id)
         # A live source honors the 50 ms minimum, not the 1000 ms buffered lead.
         assert 0 < send_ahead[0] < 250_000
+
+        async def feed():
+            for _ in range(40):
+                playback.stdin.write(pcm[:3840])
+                await playback.stdin.drain()
+                await asyncio.sleep(0.02)
+
+        def peak():
+            return max(
+                abs(sample[0])
+                for chunk in received[-10:]
+                for sample in struct.iter_unpack("<h", chunk)
+            )
+
+        await feed()
+        if remote_volume:
+            assert any(c.volume == 35 for c in commands)
+        full_volume = peak()
+        await pactl("set-sink-volume", name, "50%")
+        await feed()
+        if remote_volume:
+            assert any(c.volume == 50 for c in commands)
+            assert peak() == pytest.approx(full_volume, rel=0.05)
+        else:
+            assert 0 < peak() < full_volume * 0.6
         # Muting the selected output must silence the network stream too.
         await pactl("set-sink-mute", name, "1")
         for _ in range(80):
             playback.stdin.write(pcm[:3840])
             await playback.stdin.drain()
             await asyncio.sleep(0.02)
-        assert received[-10:] and not any(any(chunk) for chunk in received[-10:])
+        if remote_volume:
+            if remote_volume is True:
+                assert any(c.mute is True for c in commands)
+            else:
+                assert any(c.volume == 0 for c in commands)
+            assert peak() == pytest.approx(full_volume, rel=0.05)
+        else:
+            assert received[-10:] and not any(any(chunk) for chunk in received[-10:])
     finally:
         if playback and playback.returncode is None:
             playback.terminate()
@@ -215,6 +260,8 @@ async def test_playback_failure_restores_local_audio_and_revokes_approval():
 
     client = SimpleNamespace(
         is_connected=True,
+        role=lambda role_id: None,
+        awaits_role_state=lambda family: False,
         active_role_ids=["player@v1"],
         group=SimpleNamespace(
             start_stream=Mock(side_effect=RuntimeError("disconnected"))

@@ -3,6 +3,7 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")"
 command -v pactl >/dev/null
 command -v parec >/dev/null
+command -v pw-cli >/dev/null
 omarchy plugin validate "$PWD/plugin"
 runtime="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-sendspin"
 plugin="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/paulus.sendspin"
