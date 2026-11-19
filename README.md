@@ -4,6 +4,8 @@ Send your computer's audio to a Sendspin player from Omarchy's speaker menu.
 
 The plugin discovers players on the local network. Each player with unpaired access enabled appears as **Device name (Sendspin)** in the existing audio output picker. Select an output to move playing apps to it. Select your normal speakers or headphones to switch back. Volume, mute, and the per-app mixer use the normal audio controls.
 
+![Omarchy audio panel with Sendspin players and the Office preset group](docs/audio-panel.png)
+
 No pairing code is required. Playback starts only when an app sends audio to a Sendspin output. Selecting an output authorizes that client's cryptographic identity for the playback session. Clients that require pairing do not appear. The bridge uses encrypted Sendspin connections and does not enable legacy unencrypted access.
 
 ## Install
