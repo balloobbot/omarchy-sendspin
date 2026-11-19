@@ -2,9 +2,15 @@
   "schemaVersion": 1,
   "id": "paulus.sendspin",
   "name": "Sendspin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Paulus Schoutsen",
   "description": "Discover local Sendspin players and add them to the audio output menu. Audio streams only to selected outputs with unpaired access.",
-  "kinds": ["service"],
-  "entryPoints": {"service": "Service.qml"}
+  "kinds": [
+    "service",
+    "panel"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "panel": "Settings.qml"
+  }
 }

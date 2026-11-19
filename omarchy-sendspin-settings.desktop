@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Sendspin Settings
+Comment=Choose Sendspin players, local aliases, and preset groups
+Exec=omarchy-shell shell toggle paulus.sendspin
+Icon=audio-speakers
+Terminal=false
+Categories=Settings;AudioVideo;Audio;

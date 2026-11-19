@@ -15,6 +15,8 @@ from aiosendspin.noise import Identity, InMemoryServerPairingStore
 from aiosendspin.server import SendspinServer
 from aiosendspin.server.audio import AudioFormat
 
+import settings
+
 LOG = logging.getLogger("omarchy.sendspin")
 PREFIX = "omarchy_sendspin_"
 FORMAT = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
@@ -81,13 +83,52 @@ class Output:
     module: str
     task: asyncio.Task | None = None
     volume_initialized: bool = False
+    members: tuple = ()
+    label: str = ""
+
+
+class GroupVolume:
+    def __init__(self, clients):
+        self.roles = [client.role("player@v1") for client in clients]
+        self.muted = False
+
+    def get_player_volume(self):
+        values = [role.get_player_volume() for role in self.roles]
+        return None if None in values else round(sum(values) / len(values))
+
+    def get_player_muted(self):
+        return all(
+            role.get_player_muted()
+            if role.get_player_muted() is not None
+            else role.get_player_volume() == 0
+            for role in self.roles
+        )
+
+    def set_player_volume(self, volume):
+        for role in self.roles:
+            role.set_player_volume(
+                0 if self.muted and role.get_player_muted() is None else volume
+            )
+
+    def set_player_mute(self, muted):
+        self.muted = muted
+        for role in self.roles:
+            if role.get_player_muted() is not None:
+                role.set_player_mute(muted)
+            elif muted:
+                role.set_player_volume(0)
 
 
 class Bridge:
-    def __init__(self, server):
+    def __init__(self, server, manage_settings=False):
         self.server = server
         self.outputs = {}
         self.fallback = None
+        self.manage_settings = manage_settings
+        self.settings = {"players": {}, "groups": []}
+        self.catalog = (
+            settings.read_json(settings.catalog_path(), []) if manage_settings else []
+        )
 
     async def restore(self, name):
         sinks = await pulse_list("sinks")
@@ -126,10 +167,42 @@ class Bridge:
         if not default.startswith(PREFIX):
             self.fallback = default
         clients = {c.client_id: c for c in self.server.clients if eligible(c)}
-        for client_id in list(self.outputs):
-            if client_id not in clients:
-                await self.remove(self.outputs.pop(client_id))
+        if self.manage_settings:
+            try:
+                self.settings = settings.load()
+            except (ValueError, TypeError, OSError):
+                LOG.exception("Cannot read settings; keeping the last valid settings")
+            known = {p["id"]: {**p, "available": False} for p in self.catalog}
+            for client_id, client in clients.items():
+                known[client_id] = {
+                    "id": client_id,
+                    "name": client.name,
+                    "available": True,
+                }
+            catalog = sorted(known.values(), key=lambda p: (p["name"], p["id"]))
+            if catalog != self.catalog:
+                settings.write_json(settings.catalog_path(), catalog)
+                self.catalog = catalog
+        desired = {}
         for client_id, client in list(clients.items())[:32]:
+            preference = self.settings["players"].get(client_id, {})
+            if not preference.get("hidden"):
+                desired[client_id] = (
+                    (client_id,),
+                    preference.get("alias") or client.name,
+                )
+        for group in self.settings["groups"]:
+            if all(member in clients for member in group["members"]):
+                desired["group:" + group["id"]] = (
+                    tuple(group["members"]),
+                    group["name"],
+                )
+        desired = dict(list(desired.items())[:64])
+        for client_id in list(self.outputs):
+            output = self.outputs[client_id]
+            if desired.get(client_id) != (output.members, output.label):
+                await self.remove(self.outputs.pop(client_id))
+        for client_id, (members, label) in desired.items():
             if client_id in self.outputs:
                 continue
             name = sink_name(client_id)
@@ -140,25 +213,50 @@ class Bridge:
                 "rate=48000",
                 "channels=2",
                 "format=s16le",
-                f"""sink_properties="device.description='{description(client.name)}' """
+                f"""sink_properties="device.description='{description(label)}' """
                 'device.class=sound node.virtual=true priority.session=-1000"',
             )
-            self.outputs[client_id] = Output(client_id, name, module)
-            LOG.info("Available: %s", description(client.name))
+            self.outputs[client_id] = Output(
+                client_id, name, module, members=members, label=label
+            )
+            LOG.info("Available: %s", description(label))
         sinks = {s["name"]: s["index"] for s in await pulse_list("sinks")}
         active = {s["sink"] for s in await pulse_list("sink-inputs") if not s["corked"]}
-        for output in self.outputs.values():
-            wanted = sinks.get(output.name) in active
+        # A device can play one stream. Prefer the selected default, then an
+        # existing session, and move conflicting app streams to that output.
+        outputs = sorted(
+            self.outputs.values(), key=lambda o: (o.name != default, o.task is None)
+        )
+        claimed = {}
+        wanted_outputs = set()
+        for output in outputs:
+            if sinks.get(output.name) not in active:
+                continue
+            conflict = next((claimed[m] for m in output.members if m in claimed), None)
+            if conflict:
+                for app in await pulse_list("sink-inputs"):
+                    if app["sink"] == sinks.get(output.name):
+                        with suppress(RuntimeError):
+                            await pactl(
+                                "move-sink-input", str(app["index"]), conflict.name
+                            )
+                continue
+            wanted_outputs.add(output.client_id)
+            for member in output.members:
+                claimed[member] = output
+        # Stop old sessions before starting any that could reuse their members.
+        for output in outputs:
             if output.task and output.task.done():
                 output.task.result()
                 output.task = None
-            if wanted and output.task is None:
-                output.task = asyncio.create_task(self.stream(output))
-            elif not wanted and output.task:
+            if output.client_id not in wanted_outputs and output.task:
                 output.task.cancel()
                 with suppress(asyncio.CancelledError):
                     await output.task
                 output.task = None
+        for output in outputs:
+            if output.client_id in wanted_outputs and output.task is None:
+                output.task = asyncio.create_task(self.stream(output))
 
     async def control_volume(self, output, role, ready):
         subscriber = await asyncio.create_subprocess_exec(
@@ -243,21 +341,35 @@ class Bridge:
         capture = None
         stream = None
         volume_task = None
+        members = output.members or (output.client_id,)
+        clients = []
         try:
-            await self.server.trust_unpaired(output.client_id)
-            self.server.reclaim_client_for_playback(output.client_id, timeout_s=10)
+            for member in members:
+                await self.server.trust_unpaired(member)
+                self.server.reclaim_client_for_playback(member, timeout_s=10)
             async with asyncio.timeout(10):
-                while True:
-                    client = self.server.get_client(output.client_id)
-                    if (
-                        client
-                        and client.is_connected
-                        and "player@v1" in client.active_role_ids
-                        and not client.awaits_role_state("player")
-                    ):
-                        break
-                    await asyncio.sleep(0.1)
-            role = client.role("player@v1")
+                for member in members:
+                    while True:
+                        client = self.server.get_client(member)
+                        if (
+                            client
+                            and client.is_connected
+                            and "player@v1" in client.active_role_ids
+                            and not client.awaits_role_state("player")
+                        ):
+                            clients.append(client)
+                            break
+                        await asyncio.sleep(0.1)
+            client = clients[0]
+            await client.ungroup()
+            group = client.group
+            for other in clients[1:]:
+                await group.add_client(other)
+            if len(clients) > 1:
+                group.set_group_name(output.label)
+            role = (
+                client.role("player@v1") if len(clients) == 1 else GroupVolume(clients)
+            )
             if role and role.get_player_volume() is not None:
                 ready = asyncio.Event()
                 volume_task = asyncio.create_task(
@@ -285,7 +397,9 @@ class Bridge:
                 limit=CHUNK_BYTES * 4,
             )
             LOG.info("Streaming to %s", description(client.name))
-            while client.is_connected and "player@v1" in client.active_role_ids:
+            while all(
+                c.is_connected and "player@v1" in c.active_role_ids for c in clients
+            ):
                 if volume_task and volume_task.done():
                     volume_task.result()
                 async with asyncio.timeout(5):
@@ -333,7 +447,11 @@ class Bridge:
                             "Props",
                             '{"params": ["monitor.channel-volumes", true]}',
                         )
-            await self.server.untrust_unpaired(output.client_id)
+            for client in clients:
+                with suppress(Exception):
+                    await client.ungroup()
+            for member in members:
+                await self.server.untrust_unpaired(member)
 
     async def close(self):
         for output in list(self.outputs.values()):
@@ -367,7 +485,7 @@ async def main():
             server_name=f"Omarchy ({socket.gethostname()})"[:64],
             pairing_store=InMemoryServerPairingStore(),
         )
-        bridge = Bridge(server)
+        bridge = Bridge(server, manage_settings=True)
         try:
             await bridge.clean_stale()
             await server.start_server(port=8929)

@@ -261,6 +261,7 @@ async def test_playback_failure_restores_local_audio_and_revokes_approval():
     client = SimpleNamespace(
         is_connected=True,
         role=lambda role_id: None,
+        ungroup=AsyncMock(),
         awaits_role_state=lambda family: False,
         active_role_ids=["player@v1"],
         group=SimpleNamespace(
@@ -278,4 +279,113 @@ async def test_playback_failure_restores_local_audio_and_revokes_approval():
     output = Output("identity", sink_name("identity"), "123")
     await bridge.stream(output)
     bridge.restore.assert_awaited_once_with(output.name)
+    client.group.start_stream.assert_called_once()
     server.untrust_unpaired.assert_awaited_once_with("identity")
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("SENDSPIN_AUDIO_TEST"),
+    reason="Requires the local PipeWire server",
+)
+async def test_group_stream_has_identical_audio_and_timestamps():
+    server = SendspinServer(
+        loop=asyncio.get_running_loop(),
+        identity=Identity.generate(),
+        server_name="Omarchy group test",
+        pairing_store=InMemoryServerPairingStore(),
+    )
+    clients = []
+    received = [{}, {}]
+    commands = [[], []]
+    bridge = Bridge(server)
+    playback = None
+    try:
+        await server.start_server(
+            port=0, host="127.0.0.1", advertise_addresses=[], discover_clients=False
+        )
+        port = server._app_runner.addresses[0][1]
+        for index in range(2):
+            store = InMemoryClientPairingStore()
+            await store.store_pairing_config(
+                replace(await store.get_pairing_config(), unpaired_access_enabled=True)
+            )
+            client = SendspinClient(
+                identity=Identity.generate(),
+                client_name=f"Test group player {index}",
+                roles=[Roles.PLAYER],
+                pairing_store=store,
+                initial_volume=40,
+                state_supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+                player_support=ClientHelloPlayerSupport(
+                    supported_formats=[
+                        SupportedAudioFormat(
+                            codec=AudioCodec.PCM,
+                            channels=2,
+                            sample_rate=48000,
+                            bit_depth=16,
+                        )
+                    ],
+                    buffer_capacity=1000000,
+                ),
+            )
+            client.add_audio_chunk_listener(
+                lambda timestamp, pcm, fmt, ahead, chunks=received[index]: (
+                    chunks.update({timestamp: pcm})
+                )
+            )
+            client.add_server_command_listener(
+                lambda payload, target=commands[index]: target.append(payload.player)
+            )
+            clients.append(client)
+            await client.connect(f"ws://127.0.0.1:{port}/sendspin")
+        members = [client.identity.peer_id for client in clients]
+        bridge.settings = {
+            "players": {member: {"hidden": True} for member in members},
+            "groups": [{"id": "test", "name": "Test group", "members": members}],
+        }
+        await bridge.reconcile()
+        assert set(bridge.outputs) == {"group:test"}
+        name = bridge.outputs["group:test"].name
+        playback = await asyncio.create_subprocess_exec(
+            "pacat",
+            "--playback",
+            "--client-name=Omarchy Sendspin test",
+            "--property=node.dont-move=true",
+            "--volume=65536",
+            "--raw",
+            f"--device={name}",
+            "--rate=48000",
+            "--format=s16le",
+            "--channels=2",
+            stdin=asyncio.subprocess.PIPE,
+        )
+        pcm = struct.pack("<hh", 2000, -2000) * 960
+        async with asyncio.timeout(15):
+            while not all(
+                any(any(pcm) for pcm in chunks.values()) for chunks in received
+            ):
+                playback.stdin.write(pcm)
+                await playback.stdin.drain()
+                await bridge.reconcile()
+                await asyncio.sleep(0.02)
+        common = received[0].keys() & received[1].keys()
+        assert common
+        assert all(received[0][ts] == received[1][ts] for ts in common)
+        assert any(any(received[0][ts]) for ts in common)
+        await pactl("set-sink-volume", name, "60%")
+        async with asyncio.timeout(5):
+            while not all(
+                any(command.volume == 60 for command in target) for target in commands
+            ):
+                await asyncio.sleep(0.02)
+    finally:
+        if playback and playback.returncode is None:
+            playback.terminate()
+            await playback.wait()
+        await bridge.close()
+        for client in clients:
+            assert not await server.pairing_store.trusted_unpaired(
+                client.identity.peer_id
+            )
+            await client.disconnect()
+        await server.close()

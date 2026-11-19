@@ -1,0 +1,22 @@
+{
+  "loadError": "Could not load settings.",
+  "title": "Sendspin Settings",
+  "description": "Choose which players appear in the audio menu. Aliases apply only on this computer.",
+  "players": "Players",
+  "noPlayers": "No players found. Enable unpaired access on a player to get started.",
+  "available": "Available",
+  "offline": "Offline",
+  "alias": "Local alias",
+  "groups": "Preset groups",
+  "addGroup": "Add group",
+  "groupDescription": "Each group appears as one output when all its players are available. Hidden players can still play in groups.",
+  "groupName": "Group name",
+  "remove": "Remove",
+  "applyNote": "Changes to an active output stop its playback. Select it again after saving.",
+  "cancel": "Cancel",
+  "save": "Save",
+  "showPlayer": "Show %1 in the audio menu",
+  "groupNeedsName": "Enter a group name.",
+  "groupNeedsPlayers": "Select at least two players.",
+  "groupTooManyPlayers": "Select no more than 32 players."
+}
