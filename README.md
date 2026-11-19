@@ -34,7 +34,7 @@ Disabling the plugin stops the bridge and removes its outputs. If a selected pla
 - Live-audio mode avoids the extra lead time used for buffered media. Capture uses 10 ms chunks and requests a 10 ms PulseAudio buffer. Each player’s advertised minimum buffer, codec delay, and output delay still apply. The library also enforces a 50 ms scheduling floor; this is not an end-to-end latency guarantee.
 - This version has no video delay compensation or synchronized group picker.
 - Device renaming is not supported by the Sendspin specification.
-- Volume keys and the output slider send volume and mute commands to players that support remote volume. The slider starts at the player’s current level. Players without remote volume support use local audio gain instead. Per-app volume remains local.
+- Volume keys and the output slider send volume and mute commands to players that support remote volume. The slider initially adopts the player’s level. Mute preserves the selected volume, and reconnecting retains your local selection. Players without remote volume support use local audio gain instead. Per-app volume remains local.
 - No microphone capture, pairing management, or persistent client approvals.
 
 ## Files and diagnostics

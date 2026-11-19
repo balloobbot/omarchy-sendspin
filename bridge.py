@@ -80,6 +80,7 @@ class Output:
     name: str
     module: str
     task: asyncio.Task | None = None
+    volume_initialized: bool = False
 
 
 class Bridge:
@@ -170,11 +171,15 @@ class Bridge:
             sink = next(
                 s for s in await pulse_list("sinks") if s["name"] == output.name
             )
-            # Keep the player's current loudness when switching from local gain.
-            await pactl("set-sink-volume", output.name, f"{role.get_player_volume()}%")
             muted = role.get_player_muted()
-            if muted is not None:
-                await pactl("set-sink-mute", output.name, "1" if muted else "0")
+            # Adopt the device level once; subsequent sessions retain the user's selection.
+            if not output.volume_initialized:
+                await pactl(
+                    "set-sink-volume", output.name, f"{role.get_player_volume()}%"
+                )
+                if muted is not None:
+                    await pactl("set-sink-mute", output.name, "1" if muted else "0")
+                output.volume_initialized = True
             await run(
                 "pw-cli",
                 "set-param",
@@ -201,12 +206,27 @@ class Bridge:
                 )
                 current = (volume, sink["mute"])
                 if current != previous:
-                    # Players without mute support use zero volume while muted.
-                    role.set_player_volume(
-                        0 if current[1] and muted is None else volume
-                    )
-                    if muted is not None:
-                        role.set_player_mute(current[1])
+                    if muted is None:
+                        # Keep the desired level locally while emulating mute with zero.
+                        effective = 0 if current[1] else volume
+                        old_effective = (
+                            None
+                            if previous is None
+                            else (0 if previous[1] else previous[0])
+                        )
+                        if effective != old_effective:
+                            role.set_player_volume(effective)
+                    else:
+                        mute_changed = previous is None or current[1] != previous[1]
+                        if mute_changed:
+                            role.set_player_mute(current[1])
+                        # Unmute can restore a device's saved level. Apply our level last.
+                        if (
+                            previous is None
+                            or volume != previous[0]
+                            or (mute_changed and not current[1])
+                        ):
+                            role.set_player_volume(volume)
                     previous = current
                 while True:
                     line = await subscriber.stdout.readline()
